@@ -28,6 +28,11 @@ DOMAIN="diedatenlage.de"
 # Leer lassen = ohne Kontaktadresse (funktioniert, nur ohne Benachrichtigung).
 LE_EMAIL=""
 
+# www.<DOMAIN> mitbedienen? "ja" = Caddy holt auch für www ein Zertifikat und
+# leitet www dauerhaft (301) auf DOMAIN um. "nein" = nur DOMAIN.
+# Voraussetzung: ein passender DNS-Eintrag (A/AAAA) für www zeigt auf den Server.
+MIT_WWW="ja"
+
 # Systembenutzer/-gruppe, unter denen der Dienst läuft (ohne Login-Shell).
 APP_USER="datenlage"
 APP_GROUP="datenlage"
@@ -276,6 +281,13 @@ schritt_caddy() {
   inhalt+="    encode zstd gzip"$'\n'
   inhalt+="    reverse_proxy 127.0.0.1:${APP_PORT}"$'\n'
   inhalt+="}"
+  # Optional: www dauerhaft auf die Hauptdomain umleiten (Caddy zieht dafür
+  # automatisch ein eigenes Zertifikat). {uri} ist ein Caddy-Platzhalter.
+  if [[ "${MIT_WWW,,}" == "ja" ]]; then
+    inhalt+=$'\n\n'"www.${DOMAIN} {"$'\n'
+    inhalt+="    redir https://${DOMAIN}{uri} permanent"$'\n'
+    inhalt+="}"
+  fi
 
   mkdir -p /etc/caddy
   if datei_schreiben "$caddyfile" "$inhalt"; then

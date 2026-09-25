@@ -609,11 +609,18 @@ pruefroutine() {
     fehler=1
   fi
 
-  # /api/state lokal erreichbar?
-  if curl -fsS --max-time 10 "http://127.0.0.1:${APP_PORT}/api/state" >/dev/null 2>&1; then
+  # /api/state lokal erreichbar? (dem Dienst kurz Zeit zum Hochfahren geben)
+  local api_ok=0 versuch
+  for (( versuch = 1; versuch <= 10; versuch++ )); do
+    if curl -fsS --max-time 5 "http://127.0.0.1:${APP_PORT}/api/state" >/dev/null 2>&1; then
+      api_ok=1; break
+    fi
+    sleep 1
+  done
+  if [[ $api_ok -eq 1 ]]; then
     ok "/api/state antwortet lokal (127.0.0.1:${APP_PORT})."
   else
-    err "/api/state antwortet lokal NICHT (Port ${APP_PORT})."
+    err "/api/state antwortet lokal NICHT (Port ${APP_PORT}) — Details: journalctl -u datenlage -e"
     fehler=1
   fi
 

@@ -1,0 +1,12 @@
+# Einmal pro Woche (Sonntag früh) Remote Control neu starten, damit neue
+# Claude-Code-Versionen aktiv werden. Offene Sessions werden danach fortgesetzt.
+
+[Unit]
+Description=Wöchentlicher Neustart von Claude Code Remote Control
+
+[Timer]
+OnCalendar=Sun *-*-* 05:00:00
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target

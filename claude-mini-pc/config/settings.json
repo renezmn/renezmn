@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "autoUpdatesChannel": "{{CHANNEL}}",
+  "permissions": {
+    "defaultMode": "auto",
+    "deny": [
+      "Read(~/.ssh/id_ed25519)",
+      "Read(~/.ssh/id_rsa)",
+      "Read(~/.ssh/id_ecdsa)",
+      "Read(~/.claude/.credentials.json)",
+      "Edit(~/.ssh/authorized_keys)",
+      "Edit(~/.claude/settings.json)"
+    ],
+    "ask": [
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(sudo reboot *)",
+      "Bash(sudo shutdown *)",
+      "Bash(sudo poweroff *)",
+      "Bash(sudo systemctl reboot *)",
+      "Bash(sudo systemctl poweroff *)",
+      "Bash(sudo ufw *)"
+    ]
+  },
+  "autoMode": {
+    "environment": [
+      "$defaults",
+      "Organization: private single-user setup of {{OWNER}}. Primary use: operating and updating {{OWNER}}'s own servers and websites, plus software development.",
+      "Host containment: Claude Code runs as the unprivileged Linux user `{{CLAUDE_USER}}` on a dedicated, always-on Mini PC in {{OWNER}}'s home network (outbound internet only, no inbound ports). {{OWNER}} steers it remotely from the Claude mobile app via Remote Control.",
+      "Source control: github.com/{{GITHUB}} and all repositories under it belong to {{OWNER}}.",
+      "CI/CD deploy targets: {{OWNER}}'s own servers, listed in {{WORKSPACE}}/SERVERS.md and reached only through the SSH host aliases in ~/.ssh/config.d/. Uploading files with rsync/scp and running maintenance commands over ssh on them is the purpose of this machine.",
+      "Secrets management: the SSH private keys in ~/.ssh and the Claude login in ~/.claude must never be printed, copied, committed or uploaded."
+    ],
+    "allow": [
+      "$defaults",
+      "Own-server operations: when {{OWNER}} asked for an upload, deployment, update or restart, running rsync, scp or ssh against a host listed as a trusted server or CI/CD deploy target (copying files, restarting services, installing package updates, docker compose pull/up) is allowed; this machine exists for exactly that."
+    ]
+  }
+}

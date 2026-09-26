@@ -1,0 +1,27 @@
+# Hält Claude Code Remote Control rund um die Uhr am Laufen.
+# Von setup.sh nach /etc/systemd/system/ installiert ({{CLAUDE_USER}} wird ersetzt).
+#
+# Claudes Oberfläche braucht ein Terminal, deshalb läuft sie in einer tmux-Sitzung.
+# Ansehen: claude-rc attach   ·   Protokoll: claude-rc logs
+
+[Unit]
+Description=Claude Code Remote Control (Steuerung per Handy)
+Documentation=https://code.claude.com/docs/en/remote-control
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=forking
+User={{CLAUDE_USER}}
+WorkingDirectory=~
+Environment=LANG=C.UTF-8
+RuntimeDirectory=claude-rc
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/tmux -u -S /run/claude-rc/tmux.sock new-session -d -s rc -x 200 -y 50 /usr/local/lib/claude-rc/claude-rc-loop
+ExecStop=/usr/local/lib/claude-rc/claude-rc-loop --stop
+Restart=always
+RestartSec=15
+TimeoutStopSec=45
+
+[Install]
+WantedBy=multi-user.target

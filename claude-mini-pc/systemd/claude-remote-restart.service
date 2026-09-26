@@ -1,0 +1,9 @@
+# Startet Remote Control neu, damit automatisch geladene Claude-Code-Updates
+# aktiv werden. Ausgelöst von claude-remote-restart.timer.
+
+[Unit]
+Description=Claude Code Remote Control neu starten (Updates übernehmen)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl try-restart claude-remote.service

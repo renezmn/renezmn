@@ -1,0 +1,3 @@
+# Die Skripte laufen unter Linux – auch unter Windows immer mit LF auschecken.
+* text=auto eol=lf
+*.png binary

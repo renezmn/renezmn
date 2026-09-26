@@ -1,0 +1,489 @@
+#!/usr/bin/env bash
+# claude-rc – verwaltet Claude Code Remote Control auf dem Mini-PC.
+# `claude-rc help` zeigt alle Befehle.
+
+# shellcheck disable=SC1111 # „…“ sind deutsche Anführungszeichen im Text
+set -euo pipefail
+
+CONFIG_FILE="${CLAUDE_RC_CONFIG:-/etc/claude-rc.env}"
+if [[ -r "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+CLAUDE_USER="${CLAUDE_USER:-claude}"
+OWNER="${OWNER:-}"
+PERMISSION_MODE="${PERMISSION_MODE:-}"
+
+SERVICE="claude-remote.service"
+LOOP="/usr/local/lib/claude-rc/claude-rc-loop"
+TMUX_SOCKET="${CLAUDE_RC_SOCKET:-/run/claude-rc/tmux.sock}"
+TMUX_SESSION="rc"
+SELF="$(readlink -f "${BASH_SOURCE[0]}")"
+
+if [[ -t 1 ]]; then
+  B=$'\e[1m' G=$'\e[32m' Y=$'\e[33m' R=$'\e[31m' N=$'\e[0m'
+else
+  B="" G="" Y="" R="" N=""
+fi
+
+info() { printf '%s\n' "$*"; }
+ok() { printf '%s✔%s %s\n' "$G" "$N" "$*"; }
+warn() { printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
+die() {
+  printf '%s✘ %s%s\n' "$R" "$*" "$N" >&2
+  exit 1
+}
+step() { printf '\n%s== %s ==%s\n' "$B" "$*" "$N"; }
+
+usage() {
+  cat <<EOF
+${B}claude-rc${N} – Claude Code auf dem Mini-PC (Steuerung per Handy)
+
+${B}Alltag${N}
+  status                 Zustand von Dienst, Claude und Anmeldung
+  attach                 Claudes Terminal ansehen (QR-Code, Fehler); raus: Strg+b, dann d
+  logs [-f | ZEILEN]     Protokoll der Remote-Control-Schleife
+  servers                Eingetragene Server auflisten und Verbindung testen
+
+${B}Dienst${N}
+  start | stop | restart Dienst starten / stoppen / neu starten
+  disable                Dienst stoppen und Autostart ausschalten
+  update                 Claude Code sofort aktualisieren
+  doctor                 Claude-Code-Diagnose (u. a. warum Remote Control nicht startet)
+
+${B}Einrichtung${N}
+  first-run              Ersteinrichtung: anmelden, Remote Control freischalten, Dienst starten
+  login                  Claude-Anmeldung erneuern
+  add-server ALIAS BENUTZER@HOST [--port N] [--desc "Text"]
+                         Server eintragen (SSH-Config, SERVERS.md, Vertrauensliste)
+  remove-server ALIAS    Server wieder austragen
+  pubkey                 Öffentlichen SSH-Schlüssel von Claude anzeigen
+  shell                  Shell als Claude-Benutzer im Arbeitsordner öffnen
+
+Einstellungen: $CONFIG_FILE
+EOF
+}
+
+# --- Hilfsfunktionen ---------------------------------------------------------
+
+require_user() {
+  CLAUDE_HOME="$(getent passwd "$CLAUDE_USER" | cut -d: -f6 || true)"
+  [[ -n "$CLAUDE_HOME" ]] || die "Benutzer „$CLAUDE_USER“ gibt es nicht – bitte zuerst setup.sh ausführen."
+  WORKSPACE="${WORKSPACE:-$CLAUDE_HOME/workspace}"
+  CLAUDE_PATH="$CLAUDE_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+  LOOP_LOG="$CLAUDE_HOME/.local/state/claude-rc/loop.log"
+}
+
+is_claude_user() { [[ "$(id -un)" == "$CLAUDE_USER" ]]; }
+
+# Befehl als Claude-Benutzer ausführen.
+as_claude() {
+  if is_claude_user; then
+    env PATH="$CLAUDE_PATH" LANG=C.UTF-8 "$@"
+  else
+    sudo -u "$CLAUDE_USER" -H -- env PATH="$CLAUDE_PATH" LANG=C.UTF-8 "$@"
+  fi
+}
+
+# Dieses Skript als Claude-Benutzer neu starten (für Befehle, die dessen Dateien ändern).
+become_claude() {
+  is_claude_user && return 0
+  exec sudo -u "$CLAUDE_USER" -H -- env PATH="$CLAUDE_PATH" LANG=C.UTF-8 \
+    CLAUDE_RC_CONFIG="$CONFIG_FILE" "$SELF" "$@"
+}
+
+run_root() {
+  if ((EUID == 0)); then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+has_systemd() { [[ -d /run/systemd/system ]]; }
+need_systemd() { has_systemd || die "Kein systemd gefunden – der Dienst kann hier nicht verwaltet werden."; }
+service_active() { has_systemd && systemctl is-active --quiet "$SERVICE"; }
+
+ask_yes_no() { # ask_yes_no FRAGE [j|n]
+  local answer default="${2:-j}" hint="[J/n]"
+  [[ "$default" == "n" ]] && hint="[j/N]"
+  [[ -t 0 ]] || { [[ "$default" == "j" ]]; return; }
+  read -r -p "$1 $hint " answer || true
+  answer="${answer:-$default}"
+  [[ "$answer" =~ ^[jJyY] ]]
+}
+
+wait_enter() {
+  [[ -t 0 ]] || return 0
+  read -r -p "${1:-Weiter mit Enter …} " _ || true
+}
+
+ssh_ok() { ssh -n -o BatchMode=yes -o ConnectTimeout=10 "$1" true 2>/dev/null; }
+
+# JSON-Datei mit jq ändern: update_json DATEI [jq-Optionen …] FILTER
+update_json() {
+  local file=$1 tmp
+  shift
+  tmp="$(mktemp "$file.XXXXXX")"
+  if jq "$@" "$file" >"$tmp"; then
+    chmod 600 "$tmp"
+    mv "$tmp" "$file"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+# Tabellenzeile „| ALIAS | …“ aus SERVERS.md entfernen.
+remove_server_row() {
+  local file=$1 alias=$2 tmp
+  tmp="$(mktemp)"
+  awk -F'|' -v a="$alias" '{ k = $2; gsub(/^[ \t]+|[ \t]+$/, "", k); if (NF > 2 && k == a) next; print }' \
+    "$file" >"$tmp"
+  cat "$tmp" >"$file"
+  rm -f "$tmp"
+}
+
+# --- Befehle -----------------------------------------------------------------
+
+cmd_status() {
+  require_user
+  local state="unbekannt (kein systemd)" autostart="-" version auth session="nein"
+  if has_systemd; then
+    state="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+    [[ "$state" == "active" ]] &&
+      state="läuft seit $(systemctl show -p ActiveEnterTimestamp --value "$SERVICE")"
+    autostart="$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)"
+  fi
+  version="$(as_claude claude --version 2>/dev/null || echo 'nicht installiert')"
+  auth="$(as_claude claude auth status --text 2>/dev/null | head -n 2 | paste -sd ' ' - || true)"
+  as_claude tmux -S "$TMUX_SOCKET" has-session -t "$TMUX_SESSION" 2>/dev/null && session="ja"
+
+  printf '%-15s %s\n' \
+    "Dienst:" "$state" \
+    "Autostart:" "$autostart" \
+    "tmux-Sitzung:" "$session" \
+    "Claude Code:" "$version" \
+    "Anmeldung:" "${auth:-unbekannt}" \
+    "Rechte-Modus:" "${PERMISSION_MODE:-Standard}" \
+    "Arbeitsordner:" "$WORKSPACE"
+  if as_claude test -f "$LOOP_LOG"; then
+    printf '\n%sLetzte Einträge:%s\n' "$B" "$N"
+    as_claude tail -n 5 "$LOOP_LOG"
+  fi
+}
+
+cmd_attach() {
+  require_user
+  as_claude tmux -S "$TMUX_SOCKET" has-session -t "$TMUX_SESSION" 2>/dev/null ||
+    die "Der Dienst läuft gerade nicht (claude-rc status, claude-rc start)."
+  info "Du siehst gleich Claudes Terminal auf dem Mini-PC:"
+  info "  • Leertaste: QR-Code für die Claude-App ein/aus"
+  info "  • Verlassen, ohne etwas zu beenden: ${B}Strg+b${N}, dann ${B}d${N}"
+  info "  • Strg+C beendet Claude – der Dienst startet es nach ~10 s neu"
+  wait_enter
+  as_claude tmux -u -S "$TMUX_SOCKET" attach -t "$TMUX_SESSION"
+}
+
+cmd_logs() {
+  require_user
+  as_claude test -f "$LOOP_LOG" || die "Noch kein Protokoll vorhanden ($LOOP_LOG)."
+  case "${1:-}" in
+    -f) as_claude tail -n 30 -f "$LOOP_LOG" ;;
+    "") as_claude tail -n 40 "$LOOP_LOG" ;;
+    *) as_claude tail -n "$1" "$LOOP_LOG" ;;
+  esac
+}
+
+cmd_start() {
+  need_systemd
+  run_root systemctl enable --now "$SERVICE"
+  ok "Dienst läuft. In der Claude-App unter „Code“ erscheint der Mini-PC mit grünem Punkt."
+}
+
+cmd_stop() {
+  need_systemd
+  run_root systemctl stop "$SERVICE"
+  ok "Dienst gestoppt. Beim nächsten Hochfahren startet er wieder (dauerhaft aus: claude-rc disable)."
+}
+
+cmd_restart() {
+  need_systemd
+  run_root systemctl restart "$SERVICE"
+  ok "Neu gestartet – offene Sessions werden automatisch wieder aufgenommen."
+}
+
+cmd_disable() {
+  need_systemd
+  run_root systemctl disable --now "$SERVICE"
+  ok "Dienst gestoppt, Autostart aus."
+}
+
+cmd_first_run() {
+  require_user
+  [[ -t 0 ]] || die "first-run braucht ein Terminal (per SSH oder direkt am Mini-PC)."
+
+  step "Schritt 1/3 – Anmelden und Arbeitsordner vertrauen"
+  info "Gleich startet Claude im Arbeitsordner $WORKSPACE."
+  info "  1. Anmeldung: „Claude account with subscription“ wählen (Pro/Max-Abo)."
+  info "  2. Den angezeigten Link am Handy oder PC öffnen, anmelden, Code hier einfügen."
+  info "  3. „Do you trust the files in this folder?“ → Yes."
+  info "  4. Tipp: /config öffnen und „Push when Claude decides“ sowie"
+  info "     „Push when actions required“ einschalten (Push-Nachrichten aufs Handy)."
+  info "  5. Mit ${B}/exit${N} beenden."
+  wait_enter "Starten mit Enter …"
+  as_claude env -C "$WORKSPACE" claude || true
+  if [[ "$(as_claude claude auth status --json 2>/dev/null | jq -r '.loggedIn' 2>/dev/null)" != "true" ]]; then
+    die "Claude ist noch nicht angemeldet – bitte „claude-rc first-run“ wiederholen."
+  fi
+  ok "Angemeldet."
+
+  step "Schritt 2/3 – Remote Control freischalten und testen"
+  if service_active; then
+    info "Der Dienst läuft bereits – er wird für den Test kurz angehalten."
+    run_root systemctl stop "$SERVICE"
+  fi
+  info "Gleich startet der Remote-Control-Server im Vordergrund."
+  info "  1. „Enable Remote Control? (y/n)“ mit ${B}y${N} beantworten."
+  info "  2. Leertaste zeigt einen QR-Code: mit dem Handy scannen (öffnet die Claude-App)."
+  info "     Oder in der Claude-App auf „Code“ tippen – der Mini-PC hat einen grünen Punkt."
+  info "  3. Eine Test-Nachricht schicken, z. B. „Wie viel Speicher ist frei?“"
+  info "  4. Danach hier ${B}Strg+C${N} drücken."
+  wait_enter "Starten mit Enter …"
+  as_claude "$LOOP" --once || true
+
+  step "Schritt 3/3 – Dauerbetrieb einschalten"
+  if ! has_systemd; then
+    warn "Kein systemd – bitte manuell in tmux starten: tmux new -s rc $LOOP"
+    return 0
+  fi
+  run_root systemctl enable --now "$SERVICE"
+  sleep 3
+  cmd_status
+  printf '\n'
+  ok "Fertig! Der Mini-PC ist jetzt rund um die Uhr in der Claude-App erreichbar."
+  info "Nächster Schritt: Server eintragen, z. B."
+  info "  claude-rc add-server web deploy@203.0.113.10 --desc \"Webserver (nginx)\""
+}
+
+cmd_login() {
+  require_user
+  as_claude env -C "$WORKSPACE" claude auth login --claudeai
+  if service_active && ask_yes_no "Dienst neu starten, damit die neue Anmeldung genutzt wird?" j; then
+    cmd_restart
+  fi
+}
+
+cmd_shell() {
+  require_user
+  if is_claude_user; then
+    cd "$WORKSPACE"
+    exec bash -l
+  fi
+  exec sudo -u "$CLAUDE_USER" -H -- env -C "$WORKSPACE" bash -l
+}
+
+cmd_pubkey() {
+  require_user
+  as_claude cat "$CLAUDE_HOME/.ssh/id_ed25519.pub"
+}
+
+cmd_doctor() {
+  require_user
+  as_claude env -C "$WORKSPACE" claude doctor
+}
+
+cmd_update() {
+  require_user
+  as_claude claude update
+  if service_active &&
+    ask_yes_no "Dienst jetzt neu starten, damit die neue Version aktiv wird? (Laufende Aufgaben werden unterbrochen.)" n; then
+    cmd_restart
+  fi
+}
+
+cmd_servers() {
+  require_user
+  become_claude servers "$@"
+  local conf alias desc target state count=0
+  shopt -s nullglob
+  for conf in "$HOME"/.ssh/config.d/*.conf; do
+    alias="$(basename "$conf" .conf)"
+    desc="$(sed -n '1s/^# *//p' "$conf")"
+    target="$(ssh -G "$alias" 2>/dev/null |
+      awk '$1 == "user" {u = $2} $1 == "hostname" {h = $2} $1 == "port" {p = $2} END {print u "@" h ":" p}' || true)"
+    if ssh_ok "$alias"; then
+      state="${G}✔ erreichbar${N}"
+    else
+      state="${R}✘ keine Verbindung${N}"
+    fi
+    printf '%-14s %-34s %s  %s\n' "$alias" "$target" "$state" "$desc"
+    count=$((count + 1))
+  done
+  ((count)) || info "Noch keine Server eingetragen. Hinzufügen: claude-rc add-server ALIAS BENUTZER@HOST"
+}
+
+usage_add_server() {
+  cat <<'EOF'
+Aufruf: claude-rc add-server ALIAS BENUTZER@HOST [--port N] [--desc "Beschreibung"]
+
+Beispiel:
+  claude-rc add-server web deploy@203.0.113.10 --desc "Webserver (nginx, statische Seiten)"
+
+Legt ~/.ssh/config.d/ALIAS.conf an, trägt den Server in SERVERS.md ein (das liest
+Claude bei jeder Session) und markiert ihn für den Auto-Modus als eigenen Server.
+Kennt der Server Claudes Schlüssel noch nicht, wird angeboten, ihn per
+ssh-copy-id zu übertragen (einmalig mit Passwort).
+EOF
+}
+
+cmd_add_server() {
+  require_user
+  become_claude add-server "$@"
+  local alias="" target="" port=22 desc="" user host
+  while (($#)); do
+    case "$1" in
+      -p | --port)
+        port="${2:-}"
+        shift 2 || die "--port braucht einen Wert."
+        ;;
+      -d | --desc)
+        desc="${2:-}"
+        shift 2 || die "--desc braucht einen Wert."
+        ;;
+      -h | --help)
+        usage_add_server
+        return 0
+        ;;
+      -*) die "Unbekannte Option: $1" ;;
+      *)
+        if [[ -z "$alias" ]]; then
+          alias="$1"
+        elif [[ -z "$target" ]]; then
+          target="$1"
+        else
+          die "Zu viele Argumente: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+  if [[ -z "$alias" || -z "$target" ]]; then
+    usage_add_server >&2
+    exit 1
+  fi
+  [[ "$alias" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    die "Ungültiger Alias „$alias“ (erlaubt: Buchstaben, Ziffern, . _ -)."
+  [[ "$target" =~ ^([A-Za-z0-9._-]+)@([A-Za-z0-9._-]+)$ ]] ||
+    die "Ziel bitte als BENUTZER@HOST angeben, z. B. deploy@203.0.113.10"
+  user="${BASH_REMATCH[1]}"
+  host="${BASH_REMATCH[2]}"
+  if ! [[ "$port" =~ ^[0-9]+$ ]] || ((10#$port < 1 || 10#$port > 65535)); then
+    die "Ungültiger Port: $port"
+  fi
+  port=$((10#$port))
+  desc="${desc//|//}"
+  desc="${desc//$'\n'/ }"
+  [[ -n "$desc" ]] || desc="(ohne Beschreibung)"
+
+  local ssh_dir="$HOME/.ssh" conf
+  conf="$ssh_dir/config.d/$alias.conf"
+  mkdir -p "$ssh_dir/config.d"
+  chmod 700 "$ssh_dir" "$ssh_dir/config.d"
+  if [[ ! -f "$ssh_dir/id_ed25519" ]]; then
+    ssh-keygen -q -t ed25519 -N "" -C "claude@$(hostname)" -f "$ssh_dir/id_ed25519"
+  fi
+  [[ -e "$conf" ]] && warn "Alias „$alias“ gibt es schon – der Eintrag wird ersetzt."
+  (
+    umask 077
+    printf '# %s\nHost %s\n    HostName %s\n    User %s\n    Port %s\n' \
+      "$desc" "$alias" "$host" "$user" "$port" >"$conf"
+  )
+  ok "SSH-Eintrag angelegt: ~/.ssh/config.d/$alias.conf"
+
+  info "Teste Verbindung zu $user@$host:$port …"
+  if ! ssh_ok "$alias"; then
+    warn "Noch keine Verbindung – Server nicht erreichbar oder Claudes Schlüssel fehlt dort noch."
+    if [[ -t 0 ]] && ask_yes_no "Schlüssel jetzt per ssh-copy-id übertragen? (einmalig Passwort von $user@$host nötig)" n; then
+      ssh-copy-id -i "$ssh_dir/id_ed25519.pub" "$alias" || warn "ssh-copy-id hat nicht geklappt."
+    else
+      info "Trage diese Zeile auf dem Server in ~$user/.ssh/authorized_keys ein:"
+      cat "$ssh_dir/id_ed25519.pub"
+    fi
+  fi
+  if ssh_ok "$alias"; then
+    ok "Verbindung klappt."
+  else
+    warn "Verbindung klappt noch nicht – der Eintrag wird trotzdem gespeichert. Später testen: claude-rc servers"
+  fi
+
+  local servers_md="$WORKSPACE/SERVERS.md"
+  if [[ -f "$servers_md" ]]; then
+    remove_server_row "$servers_md" "$alias"
+    [[ -z "$(tail -c1 "$servers_md")" ]] || printf '\n' >>"$servers_md"
+    printf '| %s | %s@%s:%s | %s |\n' "$alias" "$user" "$host" "$port" "$desc" >>"$servers_md"
+    ok "In SERVERS.md eingetragen."
+  else
+    warn "$servers_md fehlt – Eintrag übersprungen."
+  fi
+
+  local settings="$HOME/.claude/settings.json" prefix entry
+  prefix="Trusted server \`$alias\`:"
+  entry="$prefix $user@$host (SSH port $port) – $desc. Belongs to ${OWNER:-the owner of this machine}; a CI/CD deploy target of this machine."
+  # shellcheck disable=SC2016 # jq-Variablen, keine Shell-Variablen
+  if [[ -f "$settings" ]] && update_json "$settings" --arg p "$prefix" --arg e "$entry" \
+    '.autoMode.environment = (((.autoMode.environment // ["$defaults"]) | map(select(startswith($p) | not))) + [$e])'; then
+    ok "Für den Auto-Modus als eigener Server markiert."
+  else
+    warn "Konnte $settings nicht anpassen – Auto-Modus fragt bei diesem Server evtl. öfter nach."
+  fi
+  info "Gilt ab der nächsten neuen Session in der Claude-App."
+}
+
+cmd_remove_server() {
+  require_user
+  become_claude remove-server "$@"
+  local alias="${1:-}"
+  [[ "$alias" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "Aufruf: claude-rc remove-server ALIAS"
+  local conf="$HOME/.ssh/config.d/$alias.conf" settings="$HOME/.claude/settings.json"
+  [[ -f "$conf" ]] || warn "Kein SSH-Eintrag für „$alias“ gefunden."
+  rm -f "$conf"
+  [[ -f "$WORKSPACE/SERVERS.md" ]] && remove_server_row "$WORKSPACE/SERVERS.md" "$alias"
+  if [[ -f "$settings" ]]; then
+    # shellcheck disable=SC2016 # jq-Variablen, keine Shell-Variablen
+    update_json "$settings" --arg p "Trusted server \`$alias\`:" \
+      'if .autoMode.environment then .autoMode.environment |= map(select(startswith($p) | not)) else . end' ||
+      warn "Konnte $settings nicht anpassen."
+  fi
+  ok "Server „$alias“ ausgetragen. Tipp: Claudes Schlüssel auch auf dem Server aus authorized_keys löschen."
+}
+
+main() {
+  local cmd="${1:-help}"
+  (($#)) && shift
+  case "$cmd" in
+    status) cmd_status ;;
+    attach) cmd_attach ;;
+    logs | log) cmd_logs "$@" ;;
+    servers) cmd_servers "$@" ;;
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    restart) cmd_restart ;;
+    disable) cmd_disable ;;
+    update) cmd_update ;;
+    doctor) cmd_doctor ;;
+    first-run) cmd_first_run ;;
+    login) cmd_login ;;
+    add-server) cmd_add_server "$@" ;;
+    remove-server) cmd_remove_server "$@" ;;
+    pubkey) cmd_pubkey ;;
+    shell) cmd_shell ;;
+    help | hilfe | -h | --help) usage ;;
+    *)
+      usage >&2
+      die "Unbekannter Befehl: $cmd"
+      ;;
+  esac
+}
+
+main "$@"

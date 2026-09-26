@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+# claude-rc-loop – hält `claude remote-control` auf dem Mini-PC am Laufen.
+#
+# Wird von claude-remote.service in einer tmux-Sitzung gestartet und läuft als
+# Claude-Benutzer. Wartet aufs Internet, startet den Remote-Control-Server im
+# Arbeitsordner und startet ihn nach einem Absturz oder Netzausfall neu – mit
+# wachsender Pause (10 s … 5 min), damit ein Dauerfehler nicht im Kreis läuft.
+#
+#   claude-rc-loop          Dauerschleife (so startet es der Dienst)
+#   claude-rc-loop --once   einmal im Vordergrund starten (Ersteinrichtung, Test)
+#   claude-rc-loop --stop   laufenden Server sauber beenden (ExecStop des Dienstes)
+
+set -uo pipefail
+
+CONFIG_FILE="${CLAUDE_RC_CONFIG:-/etc/claude-rc.env}"
+if [[ -r "$CONFIG_FILE" ]]; then
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+
+WORKSPACE="${WORKSPACE:-$HOME/workspace}"
+TMUX_SOCKET="${CLAUDE_RC_SOCKET:-/run/claude-rc/tmux.sock}"
+TMUX_SESSION="rc"
+STOP_FLAG="$(dirname "$TMUX_SOCKET")/stop-requested"
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-rc"
+LOG_FILE="$LOG_DIR/loop.log"
+NETWORK_CHECK_URL="${NETWORK_CHECK_URL:-https://api.anthropic.com}"
+BACKOFF_MIN=10
+BACKOFF_MAX=300
+HEALTHY_AFTER=300 # läuft Claude länger als 5 min, gilt der Start als gelungen
+
+export PATH="$HOME/.local/bin:${PATH:-/usr/local/bin:/usr/bin:/bin}"
+# Der QR-Code und die Oberfläche brauchen UTF-8.
+[[ "${LANG:-}" =~ [Uu][Tt][Ff]-?8 ]] || export LANG=C.UTF-8
+
+STOP=0
+
+log() {
+  local line
+  line="$(date '+%Y-%m-%d %H:%M:%S') $*"
+  printf '%s\n' "$line"
+  printf '%s\n' "$line" >>"$LOG_FILE" 2>/dev/null || true
+}
+
+# Protokoll klein halten (max. ~1 MB).
+trim_log() {
+  [[ -f "$LOG_FILE" ]] || return 0
+  if (($(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0) > 1048576)); then
+    tail -n 2000 "$LOG_FILE" >"$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
+}
+
+stop_requested() {
+  ((STOP)) || [[ -e "$STOP_FLAG" ]]
+}
+
+# Unterbrechbares sleep: kehrt sofort zurück, wenn ein Stopp angefordert wird.
+pause() {
+  local pid
+  sleep "$1" &
+  pid=$!
+  wait "$pid" 2>/dev/null || kill "$pid" 2>/dev/null
+  ! stop_requested
+}
+
+wait_for_network() {
+  local announced=0
+  until curl -sS -o /dev/null --max-time 10 "$NETWORK_CHECK_URL" 2>/dev/null; do
+    stop_requested && return 1
+    ((announced)) || log "Kein Internet – warte …"
+    announced=1
+    pause 15 || return 1
+  done
+  ((announced)) && log "Internet ist wieder da."
+  return 0
+}
+
+build_args() {
+  ARGS=(remote-control)
+  [[ -n "${PERMISSION_MODE:-}" ]] && ARGS+=(--permission-mode "$PERMISSION_MODE")
+  [[ -n "${SPAWN_MODE:-}" ]] && ARGS+=(--spawn "$SPAWN_MODE")
+  [[ -n "${SESSION_NAME_PREFIX:-}" ]] && ARGS+=(--remote-control-session-name-prefix "$SESSION_NAME_PREFIX")
+  if [[ -n "${EXTRA_ARGS:-}" ]]; then
+    local -a extra
+    read -r -a extra <<<"$EXTRA_ARGS"
+    ARGS+=("${extra[@]}")
+  fi
+}
+
+# Vor jedem Start den tmux-Bildschirm leeren, damit er nur den aktuellen
+# Versuch zeigt.
+clear_screen() {
+  [[ -n "${TMUX:-}" ]] || return 0
+  tmux clear-history 2>/dev/null
+  printf '\e[H\e[2J'
+}
+
+# Nach einem schnellen Absturz Claudes letzte Bildschirmzeilen (meist die
+# Fehlermeldung) ins Protokoll übernehmen, damit `claude-rc logs` sie zeigt.
+log_last_screen() {
+  [[ -n "${TMUX:-}" ]] || return 0
+  tmux capture-pane -p -J 2>/dev/null |
+    grep -v -E '^[[:space:]]*$|^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} ' |
+    tail -n 6 | sed 's/^/    │ /' >>"$LOG_FILE" 2>/dev/null || true
+}
+
+run_loop() {
+  local backoff=$BACKOFF_MIN started rc runtime
+
+  mkdir -p "$LOG_DIR"
+  rm -f "$STOP_FLAG"
+  trap 'STOP=1' INT TERM HUP
+  log "Remote-Control-Schleife gestartet (Arbeitsordner: $WORKSPACE)."
+
+  while ! stop_requested; do
+    trim_log
+    wait_for_network || break
+    if ! cd "$WORKSPACE" 2>/dev/null; then
+      log "FEHLER: Arbeitsordner $WORKSPACE fehlt – neuer Versuch in 60 s."
+      pause 60 || break
+      continue
+    fi
+
+    build_args
+    clear_screen
+    log "Starte: claude ${ARGS[*]}"
+    started=$SECONDS
+    claude "${ARGS[@]}"
+    rc=$?
+    runtime=$((SECONDS - started))
+
+    if stop_requested; then
+      log "Claude beendet (Stopp angefordert)."
+      break
+    fi
+    ((runtime >= HEALTHY_AFTER)) && backoff=$BACKOFF_MIN
+    log "Claude beendet (Code $rc nach ${runtime} s) – Neustart in ${backoff} s."
+    if ((rc == 127)); then
+      log "    Claude Code nicht gefunden – setup.sh erneut ausführen."
+    elif ((runtime < 60)); then
+      log_last_screen
+      ((rc == 1)) && log "    Tipp: Fehlt die Anmeldung? → claude-rc login"
+    fi
+    pause "$backoff" || break
+    backoff=$((backoff * 2 > BACKOFF_MAX ? BACKOFF_MAX : backoff * 2))
+  done
+
+  log "Remote-Control-Schleife beendet."
+}
+
+run_once() {
+  cd "$WORKSPACE" || {
+    echo "Arbeitsordner $WORKSPACE fehlt." >&2
+    exit 1
+  }
+  build_args
+  echo "Starte: claude ${ARGS[*]}"
+  exec claude "${ARGS[@]}"
+}
+
+# Wie Strg+C im Terminal: Claude beendet sich sauber, und die Sessions lassen
+# sich beim nächsten Start fortsetzen. Hilft das nicht, wird tmux beendet.
+stop_server() {
+  local i
+  tmux -S "$TMUX_SOCKET" has-session -t "$TMUX_SESSION" 2>/dev/null || return 0
+  touch "$STOP_FLAG" 2>/dev/null
+  # Bis zu 3× Strg+C senden, dazwischen jeweils bis zu 5 s warten.
+  for ((i = 0; i < 15; i++)); do
+    if ((i % 5 == 0)); then
+      tmux -S "$TMUX_SOCKET" send-keys -t "$TMUX_SESSION" C-c 2>/dev/null || return 0
+    fi
+    sleep 1
+    tmux -S "$TMUX_SOCKET" has-session -t "$TMUX_SESSION" 2>/dev/null || return 0
+  done
+  tmux -S "$TMUX_SOCKET" kill-server 2>/dev/null || true
+}
+
+case "${1:-}" in
+  "") run_loop ;;
+  --once) run_once ;;
+  --stop) stop_server ;;
+  *)
+    echo "Aufruf: $0 [--once | --stop]" >&2
+    exit 2
+    ;;
+esac
